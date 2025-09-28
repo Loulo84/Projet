@@ -1,0 +1,15 @@
+# Dépendances
+node_modules/
+
+# Variables d'environnement (ne pas exposer)
+.env
+
+# Bases de données locales
+*.db
+
+# Fichiers de build
+dist/
+build/
+
+# Uploads temporaires
+uploads/
