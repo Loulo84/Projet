@@ -33,3 +33,9 @@ uploads/
 *.db
 dist/
 build/
+node_modules/
+dist/
+build/
+.env
+uploads/
+*.db
