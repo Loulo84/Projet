@@ -415,7 +415,71 @@ app.post("/api/logout", (req, res) => { res.clearCookie("token"); res.json({ ok:
 app.get("/api/me", authMiddleware, (req, res) => {
   const u = db.prepare("SELECT id, email, name, company, created_at, plan, subscription_status, stripe_customer_id, quota_json FROM users WHERE id = ?").get(req.user.id);
   if (!u) return res.status(404).json({ error: "Utilisateur introuvable" });
-  const mem = currentMembership(req);
+  
+
+// ---------- Secondary confirm (token 5 min) ----------------------------------
+const SEC_CONFIRM_SECRET = process.env.SEC_CONFIRM_SECRET || "DEV_CHANGE_ME_TOKEN";
+const SEC_TOKEN_TTL = 5 * 60; // 5 minutes
+
+function readSensitiveHash() {
+  const r = db.prepare("SELECT value FROM settings WHERE key='sensitive_password_hash'").get();
+  return r?.value || null;
+}
+
+app.get("/api/secondary/status", authMiddleware, (req, res) => {
+  res.json({ enabled: !!readSensitiveHash() });
+});
+
+app.post("/api/secondary/set", authMiddleware, (req, res) => {
+  const { newPasswordSecondary } = req.body || {};
+  if (!newPasswordSecondary || String(newPasswordSecondary).length < 8) {
+    return res.status(400).json({ error: "Le mot de passe secondaire doit faire au moins 8 caractères." });
+  }
+  const hash = bcrypt.hashSync(String(newPasswordSecondary), 10);
+  db.prepare(`
+    INSERT INTO settings (key, value)
+    VALUES ('sensitive_password_hash', ?)
+    ON CONFLICT(key) DO UPDATE SET value=excluded.value
+  `).run(hash);
+  logAudit(req.user.id, "secondary_set", req);
+  res.json({ ok: true, enabled: true });
+});
+
+app.post("/api/secondary/disable", authMiddleware, (req, res) => {
+  db.prepare("DELETE FROM settings WHERE key='sensitive_password_hash'").run();
+  logAudit(req.user.id, "secondary_disable", req);
+  res.json({ ok: true, enabled: false });
+});
+
+app.post("/api/secondary/confirm", authMiddleware, (req, res) => {
+  const { passwordSecondary, scope } = req.body || {};
+  if (!scope) return res.status(400).json({ error: "scope manquant" });
+  const h = readSensitiveHash();
+  if (!h) return res.status(400).json({ error: "Mot de passe secondaire non configuré" });
+  const ok = bcrypt.compareSync(String(passwordSecondary || ""), h);
+  if (!ok) return res.status(401).json({ error: "Mot de passe invalide" });
+  const token = jwt.sign({ uid: req.user.id, scope }, SEC_CONFIRM_SECRET, { expiresIn: SEC_TOKEN_TTL });
+  res.json({ ok: true, token, ttl: SEC_TOKEN_TTL });
+});
+
+// Middleware optionnel pour protéger une route par token (si tu veux)
+function requireSecondary(scope) {
+  return (req, res, next) => {
+    const t = req.headers["x-secondary-confirm"];
+    if (!t) return res.status(401).json({ error: "Confirmation secondaire requise" });
+    try {
+      const p = jwt.verify(t, SEC_CONFIRM_SECRET);
+      if (String(p.uid) !== String(req.user.id) || p.scope !== scope) {
+        return res.status(401).json({ error: "Token invalide" });
+      }
+      next();
+    } catch {
+      return res.status(401).json({ error: "Token expiré/invalide" });
+    }
+  };
+}
+
+const mem = currentMembership(req);
   const orgs = db.prepare(`
     SELECT om.org_id AS id, o.name, om.role
     FROM org_members om JOIN organizations o ON o.id = om.org_id
@@ -517,18 +581,25 @@ app.get("/api/backup", authMiddleware, requireRole(["OWNER","ADMIN"]), (req, res
   res.end(JSON.stringify(data, null, 2));
 });
 
-// ---------- Settings (delete password) ---------------------------------------
+// ---------- Settings (sensitive password unifié) --------------------------------
 app.post("/api/settings/delete-password", authMiddleware, (req, res) => {
   const { password } = req.body || {};
-  if (!password || password.length < 6) return res.status(400).json({ error: "Mot de passe trop court" });
-  const hash = bcrypt.hashSync(password, 10);
-  db.prepare("INSERT INTO settings (key, value) VALUES ('delete_password_hash', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(hash);
-  logAudit(req.user.id, "set_delete_password", req);
+  if (!password || String(password).length < 8) {
+    return res.status(400).json({ error: "Mot de passe trop court (≥ 8 caractères)" });
+  }
+  const hash = bcrypt.hashSync(String(password), 10);
+  db.prepare(`
+    INSERT INTO settings (key, value)
+    VALUES ('sensitive_password_hash', ?)
+    ON CONFLICT(key) DO UPDATE SET value=excluded.value
+  `).run(hash);
+  logAudit(req.user.id, "sensitive_password_set", req);
   res.json({ ok: true });
 });
+
 function requireDeletePassword(pwd) {
-  const row = db.prepare("SELECT value FROM settings WHERE key='delete_password_hash'").get();
-  if (!row) return false;
+  const row = db.prepare("SELECT value FROM settings WHERE key='sensitive_password_hash'").get();
+  if (!row?.value) return false;
   return bcrypt.compareSync(String(pwd || ""), row.value);
 }
 
@@ -563,9 +634,27 @@ app.post("/api/properties", authMiddleware, requireRole(["OWNER","ADMIN","AGENT"
 });
 app.delete("/api/properties/:id", authMiddleware, requireRole(["OWNER","ADMIN"]), (req, res) => {
   const orgId = resolveOrgId(req);
+  const token = req.headers["x-secondary-confirm"];
   const { password } = req.body || {};
-  if (!requireDeletePassword(password)) return res.status(400).json({ error: "Mot de passe invalide" });
-  db.prepare("UPDATE properties SET deleted_at = ? WHERE id = ? AND org_id = ?").run(new Date().toISOString(), Number(req.params.id), orgId);
+
+  if (token) {
+    try {
+      const p = jwt.verify(token, SEC_CONFIRM_SECRET);
+      if (String(p.uid) !== String(req.user.id) || p.scope !== "delete:property") {
+        return res.status(401).json({ error: "Token invalide" });
+      }
+    } catch {
+      return res.status(401).json({ error: "Token expiré/invalide" });
+    }
+  } else {
+    if (!requireDeletePassword(password)) return res.status(400).json({ error: "Mot de passe invalide" });
+  }
+
+  db.prepare("UPDATE properties SET deleted_at = ? WHERE id = ? AND org_id = ?")
+    .run(new Date().toISOString(), Number(req.params.id), orgId);
+  logAudit(req.user.id, "property_delete", req, { id: Number(req.params.id), org_id: orgId });
+  res.json({ ok: true });
+});db.prepare("UPDATE properties SET deleted_at = ? WHERE id = ? AND org_id = ?").run(new Date().toISOString(), Number(req.params.id), orgId);
   logAudit(req.user.id, "property_delete", req, { id: Number(req.params.id), org_id: orgId });
   res.json({ ok: true });
 });
@@ -612,9 +701,27 @@ app.post("/api/tenants/:id", authMiddleware, requireRole(["OWNER","ADMIN","AGENT
 });
 app.delete("/api/tenants/:id", authMiddleware, requireRole(["OWNER","ADMIN"]), (req, res) => {
   const orgId = resolveOrgId(req);
+  const token = req.headers["x-secondary-confirm"];
   const { password } = req.body || {};
-  if (!requireDeletePassword(password)) return res.status(400).json({ error: "Mot de passe invalide" });
-  db.prepare("UPDATE tenants SET deleted_at = ? WHERE id=? AND org_id=?").run(new Date().toISOString(), Number(req.params.id), orgId);
+
+  if (token) {
+    try {
+      const p = jwt.verify(token, SEC_CONFIRM_SECRET);
+      if (String(p.uid) !== String(req.user.id) || p.scope !== "delete:tenant") {
+        return res.status(401).json({ error: "Token invalide" });
+      }
+    } catch {
+      return res.status(401).json({ error: "Token expiré/invalide" });
+    }
+  } else {
+    if (!requireDeletePassword(password)) return res.status(400).json({ error: "Mot de passe invalide" });
+  }
+
+  db.prepare("UPDATE tenants SET deleted_at = ? WHERE id=? AND org_id=?")
+    .run(new Date().toISOString(), Number(req.params.id), orgId);
+  logAudit(req.user.id, "tenant_delete", req, { id: Number(req.params.id), org_id: orgId });
+  res.json({ ok: true });
+});db.prepare("UPDATE tenants SET deleted_at = ? WHERE id=? AND org_id=?").run(new Date().toISOString(), Number(req.params.id), orgId);
   logAudit(req.user.id, "tenant_delete", req, { id: Number(req.params.id), org_id: orgId });
   res.json({ ok: true });
 });
