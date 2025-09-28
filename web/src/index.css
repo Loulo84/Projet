@@ -1,0 +1,26 @@
+/* C:\Projet\web\src\index.css */
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Base dark background/text */
+:root {
+  color-scheme: light dark;
+}
+html, body, #root {
+  height: 100%;
+}
+body {
+  @apply bg-white text-gray-900;
+}
+.dark body {
+  @apply bg-gray-950 text-gray-100;
+}
+
+/* Tables */
+thead {
+  @apply text-gray-800;
+}
+.dark thead {
+  @apply text-gray-200;
+}
