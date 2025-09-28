@@ -13,3 +13,7 @@ build/
 
 # Uploads temporaires
 uploads/
+node_modules/
+dist/
+build/
+.env
