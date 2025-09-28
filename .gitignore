@@ -21,3 +21,9 @@ node_modules/
 dist/
 build/
 .env
+node_modules/
+uploads/
+.env
+*.db
+dist/
+build/
